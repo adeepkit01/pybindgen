@@ -30,20 +30,88 @@ from pygccxml.declarations.enumeration import enumeration_t
 from .cppclass import CppClass, ReferenceCountingMethodsPolicy, FreeFunctionPolicy, ReferenceCountingFunctionsPolicy
 from .cppexception import CppException
 from pygccxml.declarations import type_traits
-from pygccxml.declarations import cpptypes
+from pygccxml.declarations import type_traits_classes
+from pygccxml.declarations import traits_impl_details
+from pygccxml.declarations import cpptypes, typedef
 from pygccxml.declarations import calldef
+from pygccxml.declarations import calldef_members
+from pygccxml.declarations import calldef_types
 from pygccxml.declarations import templates
-from pygccxml.declarations import container_traits
+from pygccxml.declarations import container_traits, class_declaration
 from pygccxml.declarations.declaration import declaration_t
 from pygccxml.declarations.class_declaration import class_declaration_t, class_t
 from . import settings
 from . import utils
+from pygccxml.utils import find_xml_generator
 
 #from pygccxml.declarations.calldef import \
 #    destructor_t, constructor_t, member_function_t
 from pygccxml.declarations.variable import variable_t
 import collections
 
+import subprocess
+from cxxfilt import demangle
+
+def check_template (demangled_name, function_name):
+    index = demangled_name.find(function_name)
+    end_index = index+len(function_name)
+    while end_index < len(demangled_name):
+      if demangled_name[end_index] == ' ':
+        end_index+=1
+        continue
+      if demangled_name[end_index] == '<':
+        return True
+      else:
+        return False
+
+def get_template_arg (demangled_name, function_name):
+    index = demangled_name.find(function_name)
+    end_index = index+len(function_name)
+    arg = ""
+    started = False
+    opened = 0
+    while end_index < len(demangled_name):
+      if demangled_name[end_index] == ' ' and not started:
+        end_index+=1
+        continue
+      elif demangled_name[end_index] == '<' and opened == 0:
+        opened+=1
+        started = True
+        end_index+=1
+        continue
+      elif demangled_name[end_index] == '<' and not opened == 0:
+        opened +=1
+      elif demangled_name[end_index] == '>' and not opened == 1:
+        opened-=1
+      elif demangled_name[end_index] == '>' and opened == 1:
+        return arg.split(',')
+      arg+=demangled_name[end_index]
+      end_index+=1
+
+def get_demangled_arg_type (demangled_decl_string):
+  arg_list = []
+  arg = ""
+  index = demangled_decl_string.rfind(')')-1
+  level = 0
+  loop = True
+  while loop:
+    if level == 0  and demangled_decl_string[index] == '(':
+      arg_list = [(arg.strip()).encode("utf-8")] + arg_list
+      loop = False
+      continue
+    elif level == 0 and demangled_decl_string[index] == ',':
+      arg_list = [(arg.strip()).encode("utf-8")] + arg_list
+      arg = ""
+      index-=1
+      continue
+    if demangled_decl_string[index] in ['>', ')', ']', '}']:
+      level+=1
+    if demangled_decl_string[index] in ['<', '(', '[', '{']:
+      level-=1
+    arg = demangled_decl_string[index] + arg
+    index-=1
+
+  return arg_list
 
 ###
 ### some patched pygccxml functions, from the type_traits module
@@ -108,7 +176,7 @@ def remove_const(type):
 
 import pygccxml.declarations.type_traits
 def find_declaration_from_name(global_ns, declaration_name):
-    decl = pygccxml.declarations.type_traits.impl_details.find_value_type(global_ns, declaration_name)
+    decl = pygccxml.declarations.traits_impl_details.impl_details.find_value_type(global_ns, declaration_name)
     return decl
 
 
@@ -134,11 +202,11 @@ class AnnotationsWarning(ModuleParserWarning):
 
 class ErrorHandler(settings.ErrorHandler):
     def handle_error(self, wrapper, exception, traceback_):
-        if hasattr(wrapper, "gccxml_definition"):
-            definition = wrapper.gccxml_definition
+        if hasattr(wrapper, "castxml_definition"):
+            definition = wrapper.castxml_definition
         elif hasattr(wrapper, "main_wrapper"):
             try:
-                definition = wrapper.main_wrapper.gccxml_definition
+                definition = wrapper.main_wrapper.castxml_definition
             except AttributeError:
                 definition = None
         else:
@@ -348,6 +416,9 @@ class AnnotationsScanner(object):
         file_name = decl.location.file_name
         line_number = decl.location.line
 
+        if not file_name:
+            return {}, {}
+
         try:
             lines = self.files[file_name]
         except KeyError:
@@ -461,7 +532,7 @@ class PygenClassifier(object):
         subclasses.  It will be called by PyBindGen for every API
         definition, and should return a section name.
 
-        :param pygccxml_definition: gccxml definition object
+        :param pygccxml_definition: castxml definition object
         :returns: section name
         """
         raise NotImplementedError
@@ -505,7 +576,7 @@ class ModuleParser(object):
         self.module_namespace_name = module_namespace_name
         self.location_filter = None
         self.header_files = None
-        self.gccxml_config = None
+        self.castxml_config = None
         self.whitelist_paths = []
         self.module_namespace = None # pygccxml module C++ namespace
         self.module = None # the toplevel pybindgen.module.Module instance (module being generated)
@@ -525,7 +596,7 @@ class ModuleParser(object):
 
     def add_pre_scan_hook(self, hook):
         """
-        Add a function to be called right before converting a gccxml
+        Add a function to be called right before converting a castxml
         definition to a PyBindGen wrapper object.  This hook function
         will be called for every scanned type, function, or method,
         and given the a chance to modify the annotations for that
@@ -557,7 +628,7 @@ class ModuleParser(object):
 
     def add_post_scan_hook(self, hook):
         """
-        Add a function to be called right after converting a gccxml definition
+        Add a function to be called right after converting a castxml definition
         to a PyBindGen wrapper object.  This hook function will be called for
         every scanned type, function, or method.  It will be called like this::
 
@@ -583,7 +654,7 @@ class ModuleParser(object):
         return False
 
     def parse(self, header_files, include_paths=None, whitelist_paths=None, includes=(),
-              pygen_sink=None, pygen_classifier=None, gccxml_options=None):
+              pygen_sink=None, pygen_classifier=None, castxml_options=None):
         """
         parses a set of header files and returns a pybindgen Module instance.
         It is equivalent to calling the following methods:
@@ -596,7 +667,7 @@ class ModuleParser(object):
          The documentation for L{ModuleParser.parse_init} explains the parameters.
         """
         self.parse_init(header_files, include_paths, whitelist_paths, includes, pygen_sink,
-                        pygen_classifier, gccxml_options)
+                        pygen_classifier, castxml_options)
         self.scan_types()
         self.scan_methods()
         self.scan_functions()
@@ -605,7 +676,7 @@ class ModuleParser(object):
 
     def parse_init(self, header_files, include_paths=None,
                    whitelist_paths=None, includes=(), pygen_sink=None, pygen_classifier=None,
-                   gccxml_options=None):
+                   castxml_options=None):
         """
         Prepares to parse a set of header files.  The following
         methods should then be called in order to finish the rest of
@@ -619,7 +690,7 @@ class ModuleParser(object):
         :param header_files: header files to parse
         :type header_files: list of string
 
-        :param include_paths: (deprecated, use the parameter gccxml_options) list of include paths
+        :param include_paths: (deprecated, use the parameter castxml_options) list of include paths
         :type include_paths: list of string
 
         :param whitelist_paths: additional directories for definitions to be included
@@ -637,7 +708,7 @@ class ModuleParser(object):
            addition to building in memory API definitions, creates a
            python script that will generate the module, when executed.
            The generated Python script can be human editable and does
-           not require pygccxml or gccxml to run, only PyBindGen to be
+           not require pygccxml or castxml to run, only PyBindGen to be
            installed.
 
            The pygen parameter can be either:
@@ -649,11 +720,11 @@ class ModuleParser(object):
 
         :param pygen_classifier: the classifier to use when pygen is given and is a dict
 
-        :param gccxml_options: extra options to pass into the
+        :param castxml_options: extra options to pass into the
             :class:`pygccxml.parser.config.gccxml_configuration_t` object as keyword
             arguments for more information).
 
-        :type gccxml_options: dict
+        :type castxml_options: dict
 
         """
         assert isinstance(header_files, list)
@@ -682,18 +753,18 @@ class ModuleParser(object):
             assert isinstance(whitelist_paths, list)
             self.whitelist_paths = [os.path.abspath(p) for p in whitelist_paths]
 
-        if gccxml_options is None:
-            gccxml_options = {}
-
+        if castxml_options is None:
+            castxml_options = {}
+        generator_path, generator_name = find_xml_generator()
         if include_paths is not None:
             assert isinstance(include_paths, list)
-            warnings.warn("Parameter include_paths is deprecated, use gccxml_options instead", DeprecationWarning,
+            warnings.warn("Parameter include_paths is deprecated, use castxml_options instead", DeprecationWarning,
                           stacklevel=2)
-            self.gccxml_config = parser.gccxml_configuration_t(include_paths=include_paths, **gccxml_options)
+            self.castxml_config = parser.xml_generator_configuration_t(include_paths=include_paths, xml_generator_path=generator_path, xml_generator=generator_name, **castxml_options)
         else:
-            self.gccxml_config = parser.gccxml_configuration_t(**gccxml_options)
+            self.castxml_config = parser.xml_generator_configuration_t(xml_generator_path=generator_path, xml_generator=generator_name, **castxml_options)
 
-        self.declarations = parser.parse(header_files, self.gccxml_config)
+        self.declarations = parser.parse(header_files, self.castxml_config)
         self.global_ns = declarations.get_global_namespace(self.declarations)
         if self.module_namespace_name == '::':
             self.module_namespace = self.global_ns
@@ -801,13 +872,13 @@ pybindgen.settings.error_handler = ErrorHandler()
             pygen_sink.indent()
 
         for class_wrapper in self.type_registry.ordered_classes:
-            if isinstance(class_wrapper.gccxml_definition, class_declaration_t):
+            if isinstance(class_wrapper.castxml_definition, class_declaration_t):
                 continue # skip classes not fully defined
             if isinstance(class_wrapper, CppException):
                 continue # exceptions cannot have methods (yet)
             #if class_wrapper.import_from_module:
             #    continue # foreign class
-            pygen_sink =  self._get_pygen_sink_for_definition(class_wrapper.gccxml_definition)
+            pygen_sink =  self._get_pygen_sink_for_definition(class_wrapper.castxml_definition)
             if pygen_sink:
                 register_methods_func = "register_%s_methods"  % (class_wrapper.mangled_full_name,)
                 pygen_sink.writeln("%s(root_module, root_module[%r])" % (register_methods_func, class_wrapper.full_name))
@@ -834,7 +905,7 @@ pybindgen.settings.error_handler = ErrorHandler()
             pygen_sink.writeln()
 
         for class_wrapper in self.type_registry.ordered_classes:
-            if isinstance(class_wrapper.gccxml_definition, class_declaration_t):
+            if isinstance(class_wrapper.castxml_definition, class_declaration_t):
                 continue # skip classes not fully defined
             if isinstance(class_wrapper, CppException):
                 continue # exceptions cannot have methods (yet)
@@ -842,7 +913,7 @@ pybindgen.settings.error_handler = ErrorHandler()
             #    continue # this is a foreign class from another module, we don't scan it
             register_methods_func = "register_%s_methods"  % (class_wrapper.mangled_full_name,)
 
-            pygen_sink =  self._get_pygen_sink_for_definition(class_wrapper.gccxml_definition)
+            pygen_sink =  self._get_pygen_sink_for_definition(class_wrapper.castxml_definition)
             if pygen_sink:
                 pygen_sink.writeln("def %s(root_module, cls):" % (register_methods_func,))
                 pygen_sink.indent()
@@ -850,7 +921,7 @@ pybindgen.settings.error_handler = ErrorHandler()
             for anon_cls, wrapper in self._anonymous_structs:
                 if wrapper is class_wrapper:
                     self._scan_class_methods(anon_cls, wrapper, pygen_sink)
-            self._scan_class_methods(class_wrapper.gccxml_definition, class_wrapper, pygen_sink)
+            self._scan_class_methods(class_wrapper.castxml_definition, class_wrapper, pygen_sink)
 
             if pygen_sink:
                 pygen_sink.writeln("return")
@@ -933,19 +1004,18 @@ pybindgen.settings.error_handler = ErrorHandler()
 
     def _get_destructor_visibility(self, cls):
         for member in cls.get_members():
-            if isinstance(member, calldef.destructor_t):
+            if isinstance(member, calldef_members.destructor_t):
                 return member.access_type
 
     def _has_public_destructor(self, cls):
         for member in cls.get_members():
-            if isinstance(member, calldef.destructor_t):
+            if isinstance(member, calldef_members.destructor_t):
                 if member.access_type != 'public':
                     return False
         return True
 
     def _scan_namespace_types(self, module, module_namespace, outer_class=None, pygen_register_function_name=None):
         root_module = module.get_root()
-
         if pygen_register_function_name:
             for pygen_sink in self._get_all_pygen_sinks():
                 pygen_sink.writeln("def %s(module):" % pygen_register_function_name)
@@ -993,13 +1063,13 @@ pybindgen.settings.error_handler = ErrorHandler()
 
         ## scan enumerations
         if outer_class is None:
-            enums = module_namespace.enums(function=self.location_filter,
+            enums = module_namespace.enumerations(function=self.location_filter,
                                            recursive=False, allow_empty=True)
         else:
             enums = []
-            for enum in outer_class.gccxml_definition.enums(function=self.location_filter,
+            for enum in outer_class.castxml_definition.enumerations(function=self.location_filter,
                                                             recursive=False, allow_empty=True):
-                if outer_class.gccxml_definition.find_out_member_access_type(enum) != 'public':
+                if outer_class.castxml_definition.find_out_member_access_type(enum) != 'public':
                     continue
                 if enum.name.startswith('__'):
                     continue
@@ -1033,6 +1103,7 @@ pybindgen.settings.error_handler = ErrorHandler()
             module.add_enum(utils.ascii(enum.name), [utils.ascii(name) for name, dummy_val in enum.values],
                             outer_class=outer_class)
 
+
         ## scan classes
         if outer_class is None:
             unregistered_classes = [cls for cls in
@@ -1046,23 +1117,24 @@ pybindgen.settings.error_handler = ErrorHandler()
         else:
             unregistered_classes = []
             typedefs = []
-            for cls in outer_class.gccxml_definition.classes(function=self.location_filter,
+            for cls in outer_class.castxml_definition.classes(function=self.location_filter,
                                                              recursive=False, allow_empty=True):
-                if outer_class.gccxml_definition.find_out_member_access_type(cls) != 'public':
+                if outer_class.castxml_definition.find_out_member_access_type(cls) != 'public':
                     continue
                 if cls.name.startswith('__'):
                     continue
                 unregistered_classes.append(cls)
 
-            for typedef in outer_class.gccxml_definition.typedefs(function=self.location_filter,
+            for typedef in outer_class.castxml_definition.typedefs(function=self.location_filter,
                                                                   recursive=False, allow_empty=True):
-                if outer_class.gccxml_definition.find_out_member_access_type(typedef) != 'public':
+                if outer_class.castxml_definition.find_out_member_access_type(typedef) != 'public':
                     continue
                 if typedef.name.startswith('__'):
                     continue
                 typedefs.append(typedef)
 
         unregistered_classes.sort(key=lambda c: c.decl_string)
+
 
         def postpone_class(cls, reason):
             ## detect the case of a class being postponed many times; that
@@ -1110,7 +1182,7 @@ pybindgen.settings.error_handler = ErrorHandler()
 
                 for typedef in module_namespace.typedefs(function=self.location_filter,
                                                          recursive=False, allow_empty=True):
-                    typedef_type = type_traits.remove_declarated(typedef.type)
+                    typedef_type = type_traits.remove_declarated(typedef.decl_type)
                     if typedef_type == cls:
                         break
                 else:
@@ -1285,7 +1357,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                 class_wrapper = module.add_class(cls_name, **kwargs)
             #print >> sys.stderr, "<<<<<ADD CLASS>>>>> ", cls_name
 
-            class_wrapper.gccxml_definition = cls
+            class_wrapper.castxml_definition = cls
             self._registered_classes[cls] = class_wrapper
             if alias:
                 class_wrapper.register_alias(normalize_name(alias))
@@ -1337,7 +1409,7 @@ pybindgen.settings.error_handler = ErrorHandler()
             for alias in module_namespace.typedefs(function=self.location_filter,
                                                    recursive=False, allow_empty=True):
 
-                type_from_name = normalize_name(str(alias.type))
+                type_from_name = normalize_name(str(alias.decl_type))
                 type_to_name = normalize_name(utils.ascii('::'.join([module.cpp_namespace_prefix, alias.name])))
 
                 for sym in '', '*', '&':
@@ -1350,8 +1422,8 @@ pybindgen.settings.error_handler = ErrorHandler()
                 ## "typedef struct _Foo Foo"; these are represented in
                 ## pygccxml by a typedef whose .type.declaration is a
                 ## class_declaration_t instead of class_t.
-                if isinstance(alias.type, cpptypes.declarated_t):
-                    cls = alias.type.declaration
+                if isinstance(alias.decl_type, cpptypes.declarated_t):
+                    cls = alias.decl_type.declaration
                     if templates.is_instantiation(cls.decl_string):
                         continue # typedef to template instantiations, must be fully defined
                     if isinstance(cls, class_declaration_t):
@@ -1377,7 +1449,7 @@ pybindgen.settings.error_handler = ErrorHandler()
 
                         class_wrapper = module.add_class(alias.name, **kwargs)
 
-                        class_wrapper.gccxml_definition = cls
+                        class_wrapper.castxml_definition = cls
                         self._registered_classes[cls] = class_wrapper
                         if cls.name != alias.name:
                             class_wrapper.register_alias(normalize_name(cls.name))
@@ -1508,10 +1580,32 @@ pybindgen.settings.error_handler = ErrorHandler()
         if container_register_key in self._containers_registered:
             return
         self._containers_registered[container_register_key] = None
-
+        element_type = None
         #print >> sys.stderr, "************* register_container", name
-
-        element_type = traits.element_type(definition)
+        #print ("*********************", templates.args(traits.class_declaration(definition).name))
+        try:
+          element_type = traits.element_type(definition)
+        except RuntimeError:
+          value_type_str = templates.args(traits.class_declaration(definition).name)[traits.element_type_index]
+          try:
+            has_space_pointer = value_type_str.endswith(' *')
+            if has_space_pointer:
+              value_type_str = value_type_str[:-2]
+              element_type = find_declaration_from_name (traits.class_declaration(definition).top_parent, value_type_str)
+              if isinstance(element_type, class_declaration.class_types):
+                element_type = cpptypes.declarated_t(element_type)
+              element_type = cpptypes.pointer_t(element_type)
+            if None is element_type:
+              raise RuntimeError(
+                        "Unable to find out %s '%s' key\\value type." %
+                        (traits.name(), traits.class_declaration(definition).decl_string))
+          except RuntimeError:
+            if value_type_str == "unsigned short":
+              element_type = find_declaration_from_name (traits.class_declaration(definition).top_parent, "short unsigned int")
+            else:
+              raise RuntimeError(
+                        "Unable to find out %s '%s' key\\value type." %
+                        (traits.name(), traits.class_declaration(definition).decl_string))
         #if traits.is_mapping(definition):
         #    key_type = traits.key_type(definition)
             #print >> sys.stderr, "************* register_container %s; element_type=%s, key_type=%s" % \
@@ -1559,8 +1653,8 @@ pybindgen.settings.error_handler = ErrorHandler()
     def _class_has_virtual_methods(self, cls):
         """return True if cls has at least one virtual method, else False"""
         for member in cls.get_members():
-            if isinstance(member, calldef.member_function_t):
-                if member.virtuality != calldef.VIRTUALITY_TYPES.NOT_VIRTUAL:
+            if isinstance(member, calldef_members.member_function_t):
+                if member.virtuality != calldef_types.VIRTUALITY_TYPES.NOT_VIRTUAL:
                     return True
         return False
 
@@ -1579,7 +1673,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                     and self._is_ostream(op.return_type) \
                     and len(op.arguments) == 2 \
                     and self._is_ostream(argument_types[0]) \
-                    and type_traits.is_convertible(cls, argument_types[1]):
+                    and type_traits_classes.is_convertible(cls, argument_types[1]):
                 #print >> sys.stderr, "<<<<<OUTPUT STREAM OP>>>>>  %s: %s " % (op.symbol, cls)
                 class_wrapper.add_output_stream_operator()
                 pygen_sink.writeln("cls.add_output_stream_operator()")
@@ -1587,8 +1681,8 @@ pybindgen.settings.error_handler = ErrorHandler()
 
             if op.symbol in ['==', '!=', '<', '<=', '>', '>='] \
                     and len(argument_types) == 2 \
-                    and type_traits.is_convertible(cls, argument_types[0]) \
-                    and type_traits.is_convertible(cls, argument_types[1]):
+                    and type_traits_classes.is_convertible(cls, argument_types[0]) \
+                    and type_traits_classes.is_convertible(cls, argument_types[1]):
                 #print >> sys.stderr, "<<<<<BINARY COMPARISON OP>>>>>  %s: %s " % (op.symbol, cls)
                 class_wrapper.add_binary_comparison_operator(op.symbol)
                 pygen_sink.writeln("cls.add_binary_comparison_operator(%r)" % (op.symbol,))
@@ -1604,7 +1698,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                 #print >> sys.stderr, "(lookup %r: %r)" % (name, class_wrapper)
                 return class_wrapper
 
-            if not type_traits.is_convertible(cls, argument_types[0]):
+            if not type_traits_classes.is_convertible(cls, argument_types[0]):
                 return
 
             ret = get_class_wrapper(op.return_type)
@@ -1670,14 +1764,14 @@ pybindgen.settings.error_handler = ErrorHandler()
         for op in self.module_namespace.free_operators(function=self.location_filter,
                                                        allow_empty=True,
                                                        recursive=True):
-            _handle_operator(op, [arg.type for arg in op.arguments])
+            _handle_operator(op, [arg.decl_type for arg in op.arguments])
 
         for op in cls.member_operators(function=self.location_filter,
                                        allow_empty=True,
                                        recursive=True):
             if op.access_type != 'public':
                 continue
-            arg_types = [arg.type for arg in op.arguments]
+            arg_types = [arg.decl_type for arg in op.arguments]
             arg_types.insert(0, cls)
             _handle_operator(op, arg_types)
 
@@ -1692,11 +1786,11 @@ pybindgen.settings.error_handler = ErrorHandler()
         self._scan_class_operators(cls, class_wrapper, pygen_sink)
 
         for member in cls.get_members():
-            if isinstance(member, calldef.member_function_t):
+            if isinstance(member, calldef_members.member_function_t):
                 if member.access_type not in ['protected', 'private']:
                     continue
 
-            elif isinstance(member, calldef.constructor_t):
+            elif isinstance(member, calldef_members.constructor_t):
                 if member.access_type not in ['protected', 'private']:
                     continue
 
@@ -1704,7 +1798,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                     have_trivial_constructor = True
 
                 elif len(member.arguments) == 1:
-                    traits = ctypeparser.TypeTraits(normalize_name(member.arguments[0].type.partial_decl_string))
+                    traits = ctypeparser.TypeTraits(normalize_name(member.arguments[0].decl_type.partial_decl_string))
                     if traits.type_is_reference and \
                             self.type_registry.root_module.get(str(traits.target), None) is class_wrapper:
                         have_copy_constructor = True
@@ -1728,15 +1822,15 @@ pybindgen.settings.error_handler = ErrorHandler()
                 continue
 
             ## ------------ method --------------------
-            if isinstance(member, (calldef.member_function_t, calldef.member_operator_t)):
-                is_virtual = (member.virtuality != calldef.VIRTUALITY_TYPES.NOT_VIRTUAL)
-                pure_virtual = (member.virtuality == calldef.VIRTUALITY_TYPES.PURE_VIRTUAL)
+            if isinstance(member, (calldef_members.member_function_t, calldef_members.member_operator_t)):
+                is_virtual = (member.virtuality != calldef_types.VIRTUALITY_TYPES.NOT_VIRTUAL)
+                pure_virtual = (member.virtuality == calldef_types.VIRTUALITY_TYPES.PURE_VIRTUAL)
 
                 kwargs = {} # kwargs passed into the add_method call
 
                 for key, val in global_annotations.items():
                     if key == 'template_instance_names' \
-                            and templates.is_instantiation(member.demangled_name):
+                            and check_template(demangle(member.get_mangled_name()), member.name):
                         pass
                     elif key == 'pygen_comment':
                         pass
@@ -1750,7 +1844,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                         warnings.warn_explicit("Annotation '%s=%s' not used (used in %s)"
                                                % (key, val, member),
                                                AnnotationsWarning, member.location.file_name, member.location.line)
-                if isinstance(member, calldef.member_operator_t):
+                if isinstance(member, calldef_members.member_operator_t):
                     if member.symbol == '()':
                         kwargs['custom_name'] = '__call__'
                     else:
@@ -1765,19 +1859,23 @@ pybindgen.settings.error_handler = ErrorHandler()
                                                                     parameter_annotations.get('return', {}))
                 argument_specs = []
                 for arg in member.arguments:
-                    argument_specs.append(self.type_registry.lookup_parameter(arg.type, arg.name,
+                    if type(arg.decl_type) == cpptypes.declarated_t and type(arg.decl_type.declaration) == typedef.typedef_t and "ns3" in str(arg.decl_type):
+                        argument_specs.append(self.type_registry.lookup_parameter(arg.decl_type.declaration.decl_type, arg.name,
                                                                               parameter_annotations.get(arg.name, {}),
                                                                               arg.default_value))
-
-
+                    else:
+                        argument_specs.append(self.type_registry.lookup_parameter(arg.decl_type, arg.name,
+                                                                              parameter_annotations.get(arg.name, {}),
+                                                                              arg.default_value))
 
                 if pure_virtual and not class_wrapper.allow_subclassing:
                     class_wrapper.set_cannot_be_constructed("pure virtual method and subclassing disabled")
                     #self.pygen_sink.writeln('cls.set_cannot_be_constructed("pure virtual method not wrapped")')
 
                 custom_template_method_name = None
-                if templates.is_instantiation(member.demangled_name):
-                    template_parameters = templates.args(member.demangled_name)
+                if check_template(demangle(member.get_mangled_name()), member.name):
+                    #print ("#################################", member.get_mangled_name())
+                    template_parameters = get_template_arg(demangle(member.get_mangled_name()), member.name)
                     template_instance_names = global_annotations.get('template_instance_names', '')
                     if template_instance_names:
                         for mapping in template_instance_names.split('|'):
@@ -1864,7 +1962,7 @@ pybindgen.settings.error_handler = ErrorHandler()
 
                 try:
                     method_wrapper = class_wrapper.add_method(member.name, return_type, arguments, **kwargs)
-                    method_wrapper.gccxml_definition = member
+                    method_wrapper.castxml_definition = member
                 except NotSupportedError as ex:
                     if pure_virtual:
                         class_wrapper.set_cannot_be_constructed("pure virtual method %r not wrapped" % member.name)
@@ -1887,7 +1985,7 @@ pybindgen.settings.error_handler = ErrorHandler()
 
 
             ## ------------ constructor --------------------
-            elif isinstance(member, calldef.constructor_t):
+            elif isinstance(member, calldef_members.constructor_t):
                 if member.access_type not in ['public', 'protected']:
                     continue
 
@@ -1896,7 +1994,7 @@ pybindgen.settings.error_handler = ErrorHandler()
 
                 argument_specs = []
                 for arg in member.arguments:
-                    argument_specs.append(self.type_registry.lookup_parameter(arg.type, arg.name,
+                    argument_specs.append(self.type_registry.lookup_parameter(arg.decl_type, arg.name,
                                                                               default_value=arg.default_value))
 
                 arglist_repr = ("[" + ', '.join([_pygen_param(args_, kwargs_) for (args_, kwargs_) in argument_specs]) +  "]")
@@ -1928,7 +2026,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                         arguments.append(Parameter.new(*a, **kw))
                     except (TypeLookupError, TypeConfigurationError) as ex:
                         warnings.warn_explicit("Parameter '%s %s' error (used in %s): %r"
-                                               % (arg.type.partial_decl_string, arg.name, member, ex),
+                                               % (arg.decl_type.partial_decl_string, arg.name, member, ex),
                                                WrapperWarning, member.location.file_name, member.location.line)
                         ok = False
                         break
@@ -1937,7 +2035,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                 if not ok:
                     continue
                 constructor_wrapper = class_wrapper.add_constructor(arguments, **kwargs)
-                constructor_wrapper.gccxml_definition = member
+                constructor_wrapper.castxml_definition = member
                 for hook in self._post_scan_hooks:
                     hook(self, member, constructor_wrapper)
 
@@ -1958,7 +2056,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                 if member.access_type == 'private':
                     continue
 
-                real_type = type_traits.remove_declarated(member.type)
+                real_type = type_traits.remove_declarated(member.decl_type)
                 if hasattr(real_type, 'name') and not real_type.name:
                     warnings.warn_explicit("Member variable %s of class %s will not be wrapped, "
                                            "because wrapping member variables of anonymous types "
@@ -1967,7 +2065,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                                            NotSupportedWarning, member.location.file_name, member.location.line)
                     continue
 
-                return_type_spec = self.type_registry.lookup_return(member.type, global_annotations)
+                return_type_spec = self.type_registry.lookup_return(member.decl_type, global_annotations)
 
                 ## pygen...
                 if 'pygen_comment' in global_annotations:
@@ -1975,41 +2073,41 @@ pybindgen.settings.error_handler = ErrorHandler()
                 if member.type_qualifiers.has_static:
                     pygen_sink.writeln("cls.add_static_attribute(%r, %s, is_const=%r)" %
                                        (member.name, _pygen_retval(*return_type_spec),
-                                        type_traits.is_const(member.type)))
+                                        type_traits.is_const(member.decl_type)))
                 else:
                     pygen_sink.writeln("cls.add_instance_attribute(%r, %s, is_const=%r)" %
                                        (member.name, _pygen_retval(*return_type_spec),
-                                        type_traits.is_const(member.type)))
+                                        type_traits.is_const(member.decl_type)))
 
                 ## convert the return value
                 try:
                     return_type = ReturnValue.new(*return_type_spec[0], **return_type_spec[1])
                 except (TypeLookupError, TypeConfigurationError) as ex:
                     warnings.warn_explicit("Return value '%s' error (used in %s): %r"
-                                           % (member.type.partial_decl_string, member, ex),
+                                           % (member.decl_type.partial_decl_string, member, ex),
                                            WrapperWarning, member.location.file_name, member.location.line)
                     continue
 
                 if member.type_qualifiers.has_static:
                     class_wrapper.add_static_attribute(member.name, return_type,
-                                                       is_const=type_traits.is_const(member.type))
+                                                       is_const=type_traits.is_const(member.decl_type))
                 else:
                     class_wrapper.add_instance_attribute(member.name, return_type,
-                                                         is_const=type_traits.is_const(member.type))
+                                                         is_const=type_traits.is_const(member.decl_type))
                 ## TODO: invoke post_scan_hooks
-            elif isinstance(member, calldef.destructor_t):
+            elif isinstance(member, calldef_members.destructor_t):
                 pass
 
         ## gccxml 0.9, unlike 0.7, does not explicitly report inheritted trivial constructors
         ## thankfully pygccxml comes to the rescue!
         if not have_trivial_constructor:
-            if type_traits.has_trivial_constructor(cls):
+            if type_traits_classes.has_trivial_constructor(cls):
                 class_wrapper.add_constructor([])
                 pygen_sink.writeln("cls.add_constructor([])")
 
         if not have_copy_constructor:
             try: # pygccxml > 0.9
-                has_copy_constructor = type_traits.has_copy_constructor(cls)
+                has_copy_constructor = type_traits_classes.has_copy_constructor(cls)
             except AttributeError: # pygccxml <= 0.9
                 has_copy_constructor = type_traits.has_trivial_copy(cls)
             if has_copy_constructor:
@@ -2148,10 +2246,10 @@ pybindgen.settings.error_handler = ErrorHandler()
             for argnum, arg in enumerate(fun.arguments):
                 annotations = parameter_annotations.get(arg.name, {})
                 if argnum == 0 and as_method is not None \
-                        and isinstance(arg.type, cpptypes.pointer_t):
+                        and isinstance(arg.decl_type, cpptypes.pointer_t):
                     annotations.setdefault("transfer_ownership", "false")
 
-                spec = self.type_registry.lookup_parameter(arg.type, arg.name,
+                spec = self.type_registry.lookup_parameter(arg.decl_type, arg.name,
                                                            annotations,
                                                            default_value=arg.default_value)
                 argument_specs.append(spec)
@@ -2159,13 +2257,13 @@ pybindgen.settings.error_handler = ErrorHandler()
                     arguments.append(Parameter.new(*spec[0], **spec[1]))
                 except (TypeLookupError, TypeConfigurationError) as ex:
                     warnings.warn_explicit("Parameter '%s %s' error (used in %s): %r"
-                                           % (arg.type.partial_decl_string, arg.name, fun, ex),
+                                           % (arg.decl_type.partial_decl_string, arg.name, fun, ex),
                                            WrapperWarning, fun.location.file_name, fun.location.line)
 
                     params_ok = False
                 except TypeError as ex:
                     warnings.warn_explicit("Parameter '%s %s' error (used in %s): %r"
-                                           % (arg.type.partial_decl_string, arg.name, fun, ex),
+                                           % (arg.decl_type.partial_decl_string, arg.name, fun, ex),
                                            WrapperWarning, fun.location.file_name, fun.location.line)
                     raise
 
@@ -2190,7 +2288,7 @@ pybindgen.settings.error_handler = ErrorHandler()
                                         as_method))
                 if params_ok:
                     function_wrapper = cpp_class.add_function_as_method(fun.name, return_type, arguments, custom_name=as_method)
-                    function_wrapper.gccxml_definition = fun
+                    function_wrapper.castxml_definition = fun
 
                 continue
 
@@ -2208,12 +2306,12 @@ pybindgen.settings.error_handler = ErrorHandler()
 
                 if params_ok:
                     function_wrapper = cpp_class.add_function_as_constructor(fun.name, return_type, arguments)
-                    function_wrapper.gccxml_definition = fun
+                    function_wrapper.castxml_definition = fun
 
                 continue
 
-            if templates.is_instantiation(fun.demangled_name):
-                template_parameters = templates.args(fun.demangled_name)
+            if check_template(demangle(fun.get_mangled_name()), fun.name):
+                template_parameters = get_template_arg(demangle(fun.get_mangled_name()), fun.name)
                 kwargs['template_parameters'] = template_parameters
                 template_instance_names = global_annotations.get('template_instance_names', '')
                 if template_instance_names:
@@ -2246,7 +2344,7 @@ pybindgen.settings.error_handler = ErrorHandler()
 
             if params_ok:
                 func_wrapper = module.add_function(fun.name, return_type, arguments, **kwargs)
-                func_wrapper.gccxml_definition = fun
+                func_wrapper.castxml_definition = fun
                 for hook in self._post_scan_hooks:
                     hook(self, fun, func_wrapper)
 
