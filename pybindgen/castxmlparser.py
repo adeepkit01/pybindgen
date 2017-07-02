@@ -1859,7 +1859,9 @@ pybindgen.settings.error_handler = ErrorHandler()
                                                                     parameter_annotations.get('return', {}))
                 argument_specs = []
                 for arg in member.arguments:
-                    if type(arg.decl_type) == cpptypes.declarated_t and type(arg.decl_type.declaration) == typedef.typedef_t and "ns3" in str(arg.decl_type):
+                    if (isinstance(arg.decl_type, cpptypes.declarated_t) and
+                        isinstance(arg.decl_type.declaration, typedef.typedef_t) and
+                            arg.decl_type.decl_string.startswith("::{}::".format(self.module_namespace_name))):
                         argument_specs.append(self.type_registry.lookup_parameter(arg.decl_type.declaration.decl_type, arg.name,
                                                                               parameter_annotations.get(arg.name, {}),
                                                                               arg.default_value))
